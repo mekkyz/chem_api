@@ -1,0 +1,152 @@
+# module API
+require 'grape-entity'
+require 'grape-swagger'
+
+class API < Grape::API
+  format :json
+  prefix :api
+  version 'v1'
+
+  helpers do
+    def present(*args)
+      options = args.count > 1 ? args.extract_options! : {}
+
+      options[:current_user] = current_user
+
+      super(*args, options)
+    end
+
+    def current_user
+      @current_user ||= detect_current_user
+    end
+
+    def detect_current_user
+      detect_current_user_from_session || detect_current_user_from_jwt
+    end
+
+    def detect_current_user_from_session
+      ::WardenAuthentication.new(env).current_user
+    end
+
+    def detect_current_user_from_jwt
+      decoded_token = JsonWebToken.decode(current_token)
+      user_id = decoded_token[:user_id]
+
+      User.find(user_id)
+    rescue StandardError
+      nil
+    end
+
+    def current_token
+      request.headers['Authorization'].split.last if token_in_header?
+    end
+
+    def token_in_header?
+      request.headers['Authorization'].present?
+    end
+
+    def user_ids
+      @user_ids ||= current_user ? (current_user.group_ids + [current_user.id]) : [0]
+    end
+
+    def authenticate!
+      error!('401 Unauthorized', 401) unless current_user
+    end
+
+    def is_public_request?
+      request.path.start_with?(
+        '/api/v1/public/',
+        '/api/v1/chemscanner/',
+        '/api/v1/chemspectra/',
+        '/api/v1/ketcher/layout',
+        '/api/v1/gate/receiving',
+        '/api/v1/gate/ping',
+      )
+    end
+
+    def cache_key(search_method, arg, molfile, collection_id, molecule_sort, opt) # rubocop:disable Metrics/ParameterLists
+      molecule_sort = molecule_sort == 1
+      inchikey = Chemotion::OpenBabelService.inchikey_from_molfile molfile
+
+      [
+        latest_updated,
+        search_method,
+        arg,
+        inchikey,
+        collection_id,
+        molecule_sort,
+        opt,
+      ]
+    end
+
+    def to_snake_case_key(k)
+      k.to_s.underscore.to_sym
+    end
+
+    def to_rails_snake_case(val)
+      case val
+      when Array
+        val.map { |v| to_rails_snake_case(v) }
+      when Hash
+        Hash[val.map { |k, v| [to_snake_case_key(k), to_rails_snake_case(v)] }] # rubocop:disable Style/HashConversion
+      else
+        val
+      end
+    end
+
+    def to_camelcase_key(k)
+      k.to_s.camelcase(:lower).to_sym
+    end
+
+    def to_json_camel_case(val)
+      case val
+      when Array
+        val.map { |v| to_json_camel_case(v) }
+      when Hash
+        Hash[val.map { |k, v| [to_camelcase_key(k), to_json_camel_case(v)] }] # rubocop:disable Style/HashConversion
+      else
+        val
+      end
+    end
+  end
+
+  before do
+    authenticate! unless is_public_request?
+  end
+
+  # desc: whitelisted tables and columns for advanced_search
+  WL_TABLES = {
+    'samples' => %w[
+      name short_label external_label xref content is_top_secret decoupled
+      stereo boiling_point melting_point density molarity_value target_amount_value
+      description location purity solvent inventory_sample sum_formula molecular_mass
+      dry_solvent
+    ],
+    'reactions' => %w[
+      name short_label status conditions rxno content temperature duration
+      role purification tlc_solvents tlc_description rf_value dangerous_products
+      plain_text_description plain_text_observation
+    ],
+    'wellplates' => %w[name short_label readout_titles content plain_text_description],
+    'screens' => %w[name collaborator requirements conditions result content plain_text_description],
+    'research_plans' => %w[name body content],
+    'elements' => %w[name short_label],
+  }.freeze
+
+  TARGET = Rails.env.production? ? 'https://www.chemotion-repository.net/' : 'http://localhost:3000/'
+
+  ELEMENTS = %w[research_plan screen wellplate reaction sample cell_line].freeze
+
+  TEXT_TEMPLATE = %w[SampleTextTemplate ReactionTextTemplate WellplateTextTemplate ScreenTextTemplate
+                     ResearchPlanTextTemplate ReactionDescriptionTextTemplate ElementTextTemplate].freeze
+
+  mount Chemotion::ThirdPartyAppAPI
+  
+  if Rails.env.development?
+    add_swagger_documentation(info: {
+                                title: 'Chemotion ELN',
+                                version: '1.0',
+                              })
+  end
+end
+# rubocop:enable Metrics/ClassLength
